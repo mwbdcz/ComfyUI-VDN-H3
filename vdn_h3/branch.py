@@ -212,8 +212,9 @@ def _frame_statistics_chunk(kf, vf, beta, a_fp32=True):
 
 # ------------------------------------------------------- compile small helpers --
 
-_COMPILED_CACHE = {}
+_COMPILED_CACHE = collections.OrderedDict()
 _COMPILED_BROKEN = set()
+_MAX_COMPILED_CACHE_SIZE = 64  # Limit compiled cache to prevent memory bloat
 
 
 def _run_compiled(key, body, *args, _mode=None, **kwargs):
@@ -232,10 +233,18 @@ def _run_compiled(key, body, *args, _mode=None, **kwargs):
             compile_mode = _mode
             if compile_mode is None and _SM89_OPTIMIZED:
                 compile_mode = "max-autotune"
-            _COMPILED_CACHE[key] = torch.compile(body, dynamic=False, mode=compile_mode)
+            compiled_fn = torch.compile(body, dynamic=False, mode=compile_mode)
+            _COMPILED_CACHE[key] = compiled_fn
+        else:
+            # Move to end for LRU tracking
+            _COMPILED_CACHE.move_to_end(key)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return _COMPILED_CACHE[key](*args, **kwargs)
+            result = _COMPILED_CACHE[key](*args, **kwargs)
+            # LRU eviction after use to prevent unbounded growth
+            while len(_COMPILED_CACHE) > _MAX_COMPILED_CACHE_SIZE:
+                _COMPILED_CACHE.popitem(last=False)
+            return result
     except Exception as e:
         _COMPILED_BROKEN.add(key)
         _log.debug("[vdn] compile of %s failed (%s); using eager", key, e)
@@ -276,8 +285,9 @@ def clear_scan_banks():
     variants go) so a cancelled run's buffers don't pin VRAM into the next one."""
     _SCAN_BANKS.clear()
     _DELTA_SCRATCH.clear()
-    for key in [k for k in _COMPILED_CACHE if isinstance(k, tuple) and k[:1] == ("scan",)]:
-        _COMPILED_CACHE.pop(key, None)
+    # Clear all compiled caches to free memory from compiled kernels
+    _COMPILED_CACHE.clear()
+    _GATHER_INDEX_CACHE.clear()
 
 
 def _scan_body(transitions, injections, start):

@@ -129,6 +129,11 @@ def clear_window_state():
     _PLAN_CACHE.clear()
     _KV_SCRATCH.clear()
     _BM_CACHE.clear()
+    # Also clear flex attention compiled function to free memory
+    global _FLEX
+    if _FLEX is not None:
+        del _FLEX
+        _FLEX = None
 
 
 def window_softmax_grouped(query, key, value, video_start, video_end,
@@ -364,6 +369,7 @@ def window_softmax_flex(query, key, value, video_start, video_end, num_frames,
                              tokens_per_frame, lo, hi, anchor_frames),
             None, None, seq, seq, query.device, _compile=True)
         _BM_CACHE[ck] = bm
+        # LRU eviction to prevent unbounded growth of BlockMask cache
         while len(_BM_CACHE) > MAX_CACHED_PLANS:
             _BM_CACHE.popitem(last=False)
     else:
