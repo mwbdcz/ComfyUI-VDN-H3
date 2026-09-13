@@ -137,6 +137,9 @@ class _StreamPrefetcher:
                 self._queue.get_nowait()
         except queue.Empty:
             pass
+        # Clear the prefetch stream to release any held memory
+        if self._stream is not None:
+            self._stream = None
 
 
 class VDNLayout:
