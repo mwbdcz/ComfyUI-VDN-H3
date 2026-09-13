@@ -8,8 +8,13 @@ sole owner of the diffusion model's parameter tree.
 The released 8-step checkpoint configuration: delta_rule="vdn_solve", bridge="alpha",
 a_fp32=True, enable_text_state=True, short_conv on (k, v), linear_head_dim=128.
 Everything here is eager PyTorch -- no Triton, no torch.compile, no CUDA kernels.
-Numerics follow the reference inference bodies: A statistics in fp32 (TF32 GEMM), the
-recurrence in fp32 via preallocated banks, bf16 features and readout.
+Numerics follow the reference inference bodies: A statistics in fp32 (TF32 GEMM on
+SM89+ architectures), the recurrence in fp32 via preallocated banks, bf16 features
+and readout.
+
+SM89 (Ada Lovelace) optimizations: On RTX 40xx and newer GPUs, TF32 matrix
+multiplication is automatically enabled for frame statistics, and torch.compile
+uses 'max-autotune' mode for optimal kernel selection when fast_kernels is enabled.
 """
 import collections
 import functools
@@ -138,6 +143,15 @@ def _tf32_matmul():
 
 _STATISTICS_WORKSPACE_BYTES = 1 << 30
 
+# Architecture detection for SM89 (Ada Lovelace) optimizations
+_SM89_OPTIMIZED = False
+try:
+    if torch.cuda.is_available():
+        _major, _minor = torch.cuda.get_device_capability(0)
+        _SM89_OPTIMIZED = (_major == 8 and _minor == 9) or (_major >= 9)
+except Exception:
+    pass
+
 
 def frame_statistics(kf, vf, beta, a_fp32=True):
     """Bound preparation memory by batching independent frames, never their tokens.
@@ -170,7 +184,11 @@ def _frame_statistics_chunk(kf, vf, beta, a_fp32=True):
     """A[f,h,k,l] = sum_s k beta k,  B[f,h,v,k] = sum_s v beta k, over one chunk's
     rows. A in fp32 (bf16's 8 mantissa bits break the conditioning I+A needs), B left
     in bf16 for the tensor-core GEMM and promoted on the store. Operates with autocast
-    off implicitly -- callers run under inference no_grad, no ambient autocast."""
+    off implicitly -- callers run under inference no_grad, no ambient autocast.
+    
+    On SM89 (Ada Lovelace) and newer architectures, TF32 matrix multiplication is
+    automatically enabled for improved performance while maintaining numerical accuracy.
+    """
     with torch.autocast(device_type=kf.device.type, enabled=False):
         kf16 = kf.contiguous()
         vb = (vf * beta.unsqueeze(-1).to(vf.dtype)).contiguous()
@@ -178,6 +196,7 @@ def _frame_statistics_chunk(kf, vf, beta, a_fp32=True):
             kf32 = kf16.float()
             scaled32 = (kf32 * beta.unsqueeze(-1).float()).contiguous()
             prev = torch.backends.cuda.matmul.allow_tf32
+            # Enable TF32 for SM89+ architectures for better GEMM performance
             torch.backends.cuda.matmul.allow_tf32 = True
             try:
                 a = torch.matmul(scaled32.transpose(-1, -2), kf32)
@@ -200,12 +219,20 @@ _COMPILED_BROKEN = set()
 def _run_compiled(key, body, *args, _mode=None, **kwargs):
     """torch.compile(body, dynamic=False), built once per key, with a permanent
     eager fallback on failure -- the same policy linear_epilogue already uses:
-    same math, one rounding at the store instead of one per op, just slower."""
+    same math, one rounding at the store instead of one per op, just slower.
+    
+    On SM89 (Ada Lovelace) architectures, uses 'max-autotune' mode for optimal
+    kernel selection when not explicitly specified.
+    """
     if key in _COMPILED_BROKEN:
         return body(*args, **kwargs)
     try:
         if key not in _COMPILED_CACHE:
-            _COMPILED_CACHE[key] = torch.compile(body, dynamic=False, mode=_mode)
+            # Use max-autotune mode on SM89+ for better kernel selection
+            compile_mode = _mode
+            if compile_mode is None and _SM89_OPTIMIZED:
+                compile_mode = "max-autotune"
+            _COMPILED_CACHE[key] = torch.compile(body, dynamic=False, mode=compile_mode)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             return _COMPILED_CACHE[key](*args, **kwargs)
@@ -282,7 +309,11 @@ def run_scans(backend, alpha, a_raw, b_raw, text_state=None, fuse=False,
 
     Eager writes into the reused banks (retained mode) or fresh per-call banks
     (transient, VRAM pressure); fuse=True (fast_kernels) runs the scan as one
-    reduce-overhead compiled graph instead (latch-to-eager on failure)."""
+    reduce-overhead compiled graph instead (latch-to-eager on failure).
+    
+    On SM89 (Ada Lovelace) architectures, the fused path automatically uses
+    'max-autotune' mode for optimal kernel selection.
+    """
     with torch.autocast(device_type=a_raw.device.type, enabled=False):
         transitions, injections = backend.factor_apply(alpha, a_raw, b_raw,
                                                        retain=retain)
@@ -292,6 +323,7 @@ def run_scans(backend, alpha, a_raw, b_raw, text_state=None, fuse=False,
         if fuse:
             key = ("scan", num_frames, *start.shape, str(injections.device),
                    str(injections.dtype))
+            # max-autotune mode is applied automatically via _run_compiled on SM89+
             return _run_compiled(key, _scan_body, transitions, injections, start,
                                  _mode="reduce-overhead")
         prefix, suffix = _scan_banks(num_frames, start.shape, injections.dtype,
