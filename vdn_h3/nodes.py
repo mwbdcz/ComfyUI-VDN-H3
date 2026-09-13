@@ -263,7 +263,11 @@ class ApplyVDNH3:
 class ApplyVDNH3Advanced:
     """Everything the base node does, plus per-adapter strengths, ablation knobs that
     deviate from the released spec (window radius/chunk, anchor frames, text state,
-    linear branch), and compile-fused branch kernels (fast_kernels)."""
+    linear branch), and compile-fused branch kernels (fast_kernels).
+    
+    On SM89 (Ada Lovelace) GPUs, torch.compile automatically uses 'max-autotune' mode
+    for optimal kernel selection when fast_kernels is enabled.
+    """
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -345,7 +349,9 @@ class ApplyVDNH3Advanced:
                            "math; falls back to eager if compile fails. First run "
                            "compiles. Known to drift on 8-step DMD stages "
                            "(stage-dmd-*) on torch 2.10 -- ablation use only, "
-                           "keep off for final renders (a warning is logged)."}),
+                           "keep off for final renders (a warning is logged). "
+                           "On SM89 (Ada Lovelace) GPUs, automatically uses "
+                           "max-autotune mode for optimal kernel selection."}),
         }}
 
     RETURN_TYPES = ("MODEL",)
